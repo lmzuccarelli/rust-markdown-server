@@ -1,6 +1,7 @@
 use http::StatusCode;
 use http_body_util::*;
 use hyper::body::Bytes;
+use hyper::header::CONTENT_TYPE;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{HeaderMap, Method};
@@ -9,6 +10,7 @@ use hyper_util::rt::TokioIo;
 use std::convert::Infallible;
 use std::fs;
 use std::net::SocketAddr;
+use surrealkv::{Tree, TreeBuilder};
 use tokio::net::TcpListener;
 
 async fn markdown(
@@ -17,16 +19,24 @@ async fn markdown(
     let mut response = Response::new(Full::default());
     match req.method() {
         &Method::GET => {
-            let uri = req.uri().path_and_query();
-            let file = uri.unwrap().path().split("/").nth(1).unwrap();
-            let data = fs::read_to_string(&format!("{}", file));
-            let mut headers = HeaderMap::new();
-            headers.insert("Content-Type", "text/markdown".parse().unwrap());
-            if data.is_err() {
-                *response.body_mut() = Full::from("contents not found\n");
-            } else {
-                *response.headers_mut() = headers;
-                *response.body_mut() = Full::from(data.unwrap());
+            let req_uri = req.uri().to_string();
+            let params: Vec<&str> = req_uri.split("/").collect();
+            let key = params.last().unwrap().to_string();
+            let result = db_read(key.clone()).await;
+            match result {
+                Ok(document) => {
+                    fs::write(format!("./{}.md", key), document.clone())
+                        .expect("should write file");
+                    let mut headers = HeaderMap::new();
+                    headers.insert(CONTENT_TYPE, "text/markdown".parse().unwrap());
+                    *response.headers_mut() = headers;
+                    *response.body_mut() = Full::from(document.to_string());
+                }
+                Err(e) => {
+                    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    *response.body_mut() =
+                        Full::from(format!("could no read db {}", e.to_string()));
+                }
             }
         }
         _ => {
@@ -47,6 +57,43 @@ where
 {
     fn execute(&self, fut: F) {
         tokio::task::spawn(fut);
+    }
+}
+
+pub fn get_error(msg: String) -> Box<dyn std::error::Error> {
+    Box::from(format!("{}", msg.to_lowercase()))
+}
+
+pub fn get_opts() -> Result<Tree, Box<dyn std::error::Error>> {
+    let tree = TreeBuilder::new()
+        .with_path(format!("{}.kv", "/home/lzuccarelli/database/documents").into())
+        .with_max_memtable_size(100 * 1024 * 1024)
+        .with_block_size(4096)
+        .with_level_count(1);
+    let t = tree.build()?;
+    println!("[get_opts] tree built");
+    Ok(t)
+}
+
+async fn db_read(key: String) -> Result<String, Box<dyn std::error::Error>> {
+    let tree = get_opts()?;
+    // start transaction
+    let mut txn = tree.begin().map_err(|e| get_error(e.to_string()))?;
+    let b_key = Bytes::from(key.clone());
+    let res = txn.get(&b_key).map_err(|e| get_error(e.to_string()))?;
+    // commit transaction
+    txn.commit().await?;
+    tree.close().await?;
+    match res {
+        Some(val) => {
+            let document = String::from_utf8(val.to_vec())?;
+            Ok(document)
+        }
+        None => {
+            let msg = format!("no document found with key {}", key);
+            println!("{}", msg);
+            Err(get_error(msg))
+        }
     }
 }
 
